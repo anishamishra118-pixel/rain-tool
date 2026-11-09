@@ -1,0 +1,243 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Frozen Living Drop</title>
+<style>
+  html,body{margin:0;height:100%;background:#fff}
+  body{display:flex;align-items:center;justify-content:center;overflow:hidden;font:11px/1 Helvetica,Arial,sans-serif;color:#000}
+  canvas{display:block}
+  .panel{position:fixed;left:16px;bottom:16px;display:grid;grid-template-columns:auto 120px 36px;gap:8px 10px;align-items:center;letter-spacing:.08em;text-transform:uppercase}
+  .panel input[type=range]{width:120px;accent-color:#000}
+  .panel output{text-align:right;font-variant-numeric:tabular-nums}
+  .ui{position:fixed;right:16px;bottom:16px;display:flex;gap:8px}
+  button,select{background:none;border:1px solid #000;color:#000;padding:6px 12px;font:inherit;letter-spacing:.08em;text-transform:uppercase;cursor:pointer;white-space:nowrap}
+  select{padding:5px 8px}
+  button:hover{background:#000;color:#fff}
+  .hidden .panel,.hidden .ui{display:none}
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+
+<div class="panel">
+  <span>Density</span><input type="range" id="density" min="0.4" max="3" step="0.1" value="1.4"><output></output>
+  <span>Blur</span><input type="range" id="blur" min="2" max="50" step="1" value="22"><output></output>
+  <span>Motion</span><input type="range" id="motion" min="0" max="30" step="0.5" value="6"><output></output>
+  <span>Speed</span><input type="range" id="speed" min="0" max="3" step="0.05" value="0.6"><output></output>
+  <span>Creep</span><input type="range" id="creep" min="0" max="80" step="1" value="30"><output></output>
+  <span>Swell</span><input type="range" id="swell" min="0" max="0.9" step="0.01" value="0.4"><output></output>
+  <span>Position</span><input type="range" id="position" min="0" max="360" step="1" value="0"><output></output>
+</div>
+
+<div class="ui">
+  <button id="pause">Pause</button>
+  <button id="save">Save PNG</button>
+  <select id="vbg"><option value="#fff">White bg</option><option value="">Transparent (Chrome)</option></select>
+  <button id="rec">Record</button>
+</div>
+
+<script>
+// Press H to hide/show the controls.
+
+// ---- Form (canvas pixels) ----
+const W = 1200, CX = 600, CY = 600;
+const R = 380;           // drop radius
+const GROUPS = 8;        // jitter frequency groups
+const INK = 1.6;         // darkness per particle — higher = more solid black, lower = more grain
+
+// Where the edge is blurred (screen angles in degrees, 0 = right, 90 = bottom).
+// Left: a long soft arc from bottom-left round to the top. Right: a shorter one.
+// Each of the four meeting points between crisp and blurred drifts on its own irregular rhythm,
+// so the blur grows out of those tense edges and recedes again.
+const BASE = [100, 268, -45, 42];   // left start, left end, right start, right end
+const EDGE = [...BASE];             // current positions, updated every frame
+const smooth = (a, b, x) => { x = Math.min(1, Math.max(0, (x - a) / (b - a))); return x * x * (3 - 2 * x); };
+const band = (x, a, b, r) => smooth(a, a + r, x) * (1 - smooth(b - r, b, x));
+function blurEnv(deg) {
+  const d = ((deg % 360) + 360) % 360, d2 = d > 180 ? d - 360 : d;
+  return Math.max(band(d, EDGE[0], EDGE[1], 22), .9 * band(d2, EDGE[2], EDGE[3], 25));
+}
+const SEEDS = Array.from({ length: 4 }, () => [Math.random() * 6.28, Math.random() * 6.28, Math.random() * 6.28]);
+const wobble = (t, p) => (Math.sin(t * .37 + p[0]) + .6 * Math.sin(t * .91 + p[1]) + .35 * Math.sin(t * 1.73 + p[2])) / 1.95;
+function moveEdges(t) {
+  // negative sign on the start edges so a positive wobble always means "blur grows"
+  EDGE[0] = BASE[0] - P.creep * wobble(t, SEEDS[0]); EDGE[1] = BASE[1] + P.creep * wobble(t, SEEDS[1]);
+  EDGE[2] = BASE[2] - P.creep * wobble(t, SEEDS[2]); EDGE[3] = BASE[3] + P.creep * wobble(t, SEEDS[3]);
+}
+// Outward swell: uneven pulses at different points round the rim
+const MODES = [[2, .23], [3, .41], [5, .67], [7, .53]], MP = MODES.map(() => Math.random() * 6.28);
+
+const cv = document.getElementById('c'), ctx = cv.getContext('2d');
+cv.width = cv.height = W;
+const img = ctx.createImageData(W, W), u32 = new Uint32Array(img.data.buffer), acc = new Float32Array(W * W);
+
+const P = {};
+const ids = ['density', 'blur', 'motion', 'speed', 'creep', 'swell', 'position'];
+function readControls() {
+  for (const id of ids) { const el = document.getElementById(id); P[id] = +el.value; el.nextElementSibling.textContent = P[id]; }
+}
+
+const gauss = () => { let u = 0, v = 0; while (!u) u = Math.random(); while (!v) v = Math.random();
+  return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * v); };
+
+// Spatial phases of the flow field; sin/cos are precomputed per particle so each frame is just multiply-adds.
+const phases = (x, y) => [.011 * y + .004 * x, .007 * (x + y), .012 * x - .003 * y, .008 * (x - y) + 1.3];
+
+let N, NH, hx, hy, ux, uy, fr, S, C, js, jc, grp, hc, hs, hu, hdeg, MS, MC;
+function build() {
+  const area = Math.PI * R * R;
+  N = Math.round(P.density * area);
+  // halo count chosen so its density at the edge matches the interior (seamless fade)
+  // halo goes all the way round (the blur can reach anywhere); weights adjust per frame
+  NH = Math.round(P.density * 2 * Math.PI * R * P.blur / Math.sqrt(2 / Math.PI));
+  const T = N + NH;
+  hx = new Float32Array(T); hy = new Float32Array(T);
+  ux = new Float32Array(T); uy = new Float32Array(T); fr = new Float32Array(T);
+  S = Array.from({ length: 4 }, () => new Float32Array(T)); C = Array.from({ length: 4 }, () => new Float32Array(T));
+  js = new Float32Array(T); jc = new Float32Array(T); grp = new Uint8Array(T);
+  hc = new Float32Array(NH); hs = new Float32Array(NH); hu = new Float32Array(NH); hdeg = new Float32Array(NH);
+  MS = MODES.map(() => new Float32Array(NH)); MC = MODES.map(() => new Float32Array(NH));
+
+  const setCommon = (i, x, y) => {
+    const ph = phases(x, y);
+    for (let k = 0; k < 4; k++) { S[k][i] = Math.sin(ph[k]); C[k][i] = Math.cos(ph[k]); }
+    const j = Math.random() * 6.283; js[i] = Math.sin(j); jc[i] = Math.cos(j); grp[i] = (Math.random() * GROUPS) | 0;
+  };
+  for (let i = 0; i < N; i++) {             // interior: uniform in the disc
+    const a = Math.random() * 6.283, r = R * Math.sqrt(Math.random());
+    hx[i] = CX + Math.cos(a) * r; hy[i] = CY + Math.sin(a) * r;
+    ux[i] = Math.cos(a); uy[i] = Math.sin(a); fr[i] = 1 - Math.pow(r / R, 6);   // radial motion fades to 0 at the rim
+    setCommon(i, hx[i], hy[i]);
+  }
+  for (let k = 0; k < NH; k++) {            // halo: outward half-gaussian beyond the rim
+    const a = Math.random() * 6.283, i = N + k;
+    hc[k] = Math.cos(a); hs[k] = Math.sin(a); hdeg[k] = a * 180 / Math.PI; hu[k] = Math.min(3, Math.abs(gauss()));
+    MODES.forEach(([m], j) => { MS[j][k] = Math.sin(m * a + MP[j]); MC[j][k] = Math.cos(m * a + MP[j]); });
+    ux[i] = hc[k]; uy[i] = hs[k]; fr[i] = .35 * hu[k] / 3;   // halo base stays put, outer haze drifts
+    hx[i] = CX + hc[k] * (R + hu[k] * P.blur); hy[i] = CY + hs[k] * (R + hu[k] * P.blur);
+    setCommon(i, hx[i], hy[i]);
+  }
+}
+
+const cg = new Float32Array(GROUPS), sg = new Float32Array(GROUPS), OM = Array.from({ length: GROUPS }, (_, g) => .8 + g * .25);
+let phiDeg = 0, phi = 0, dirty = false;
+let tau = 0, last = performance.now(), paused = false;
+
+function splat(x, y, w) {
+  const x0 = x | 0, y0 = y | 0;
+  if (x0 < 0 || y0 < 0 || x0 >= W - 1 || y0 >= W - 1) return;
+  const fx = x - x0, fy = y - y0, i = y0 * W + x0;
+  acc[i] += w * (1 - fx) * (1 - fy); acc[i + 1] += w * fx * (1 - fy);
+  acc[i + W] += w * (1 - fx) * fy; acc[i + W + 1] += w * fx * fy;
+}
+
+function render() {
+  phi = phiDeg * Math.PI / 180;
+  moveEdges(tau);
+  const A = P.motion * .5, J = Math.min(1.5, P.motion * .25);
+  const a1 = .7 * tau, a2 = -.45 * tau, a3 = -.6 * tau, a4 = .5 * tau;
+  const c1 = Math.cos(a1), s1 = Math.sin(a1), c2 = Math.cos(a2), s2 = Math.sin(a2);
+  const c3 = Math.cos(a3), s3 = Math.sin(a3), c4 = Math.cos(a4), s4 = Math.sin(a4);
+  for (let g = 0; g < GROUPS; g++) { cg[g] = Math.cos(OM[g] * tau); sg[g] = Math.sin(OM[g] * tau); }
+  const [S0, S1, S2, S3] = S, [C0, C1, C2, C3] = C, R2 = R * R;
+  acc.fill(0);
+
+  for (let i = 0; i < N; i++) {
+    const g = grp[i], ca = cg[g], sa = sg[g];
+    let dx = A * (S0[i] * c1 + C0[i] * s1 + S1[i] * c2 + C1[i] * s2) + J * (jc[i] * ca - js[i] * sa);
+    let dy = A * (S2[i] * c3 + C2[i] * s3 + S3[i] * c4 + C3[i] * s4) + J * (js[i] * ca + jc[i] * sa);
+    const q = (dx * ux[i] + dy * uy[i]) * (1 - fr[i]); dx -= ux[i] * q; dy -= uy[i] * q;
+    let x = hx[i] - CX + dx, y = hy[i] - CY + dy;
+    const r2 = x * x + y * y;
+    if (r2 > R2) {
+      // crisp edge: reflect back inside. Blurred edge: let it spill out with the halo.
+      const e = blurEnv(Math.atan2(y, x) * 57.2958 - phiDeg);
+      const r = Math.sqrt(r2), k = (R + (r - R) * (2 * e - 1)) / r; x *= k; y *= k;
+    }
+    splat(x + CX, y + CY, INK);
+  }
+
+  const cp = Math.cos(phi), sp = Math.sin(phi);
+  const mc = MODES.map(([, w]) => Math.cos(w * tau)), ms = MODES.map(([, w]) => Math.sin(w * tau));
+  const [M0, M1, M2, M3] = MS, [N0, N1, N2, N3] = MC, sw = P.swell / 2.2;
+  for (let k = 0; k < NH; k++) {
+    const i = N + k;
+    const b = blurEnv(hdeg[k]);
+    if (b < .03) continue;                                   // crisp here: no haze
+    const pulse = M0[k] * mc[0] + N0[k] * ms[0] + M1[k] * mc[1] + N1[k] * ms[1]
+                + .7 * (M2[k] * mc[2] + N2[k] * ms[2]) + .5 * (M3[k] * mc[3] + N3[k] * ms[3]);
+    const br = b * Math.max(.2, 1 + sw * pulse);             // local blur width
+    const r = R + hu[k] * P.blur * br;
+    const g = grp[i], ca = cg[g], sa = sg[g];
+    let dx = A * (S0[i] * c1 + C0[i] * s1 + S1[i] * c2 + C1[i] * s2) + J * (jc[i] * ca - js[i] * sa);
+    let dy = A * (S2[i] * c3 + C2[i] * s3 + S3[i] * c4 + C3[i] * s4) + J * (js[i] * ca + jc[i] * sa);
+    const vx = hc[k] * cp - hs[k] * sp, vy = hs[k] * cp + hc[k] * sp;   // rotated by Position
+    const q = (dx * vx + dy * vy) * (1 - fr[i]); dx -= vx * q; dy -= vy * q;
+    splat(CX + vx * r + dx, CY + vy * r + dy, INK * Math.min(4, 1 / br));   // keeps the fade seamless as width changes
+  }
+
+  for (let i = 0, n = W * W; i < n; i++) {
+    const a = acc[i];
+    u32[i] = a <= 0 ? 0 : (a >= 1 ? 255 : (a * 255) | 0) << 24;   // black, alpha = density
+  }
+  ctx.putImageData(img, 0, 0);
+  copyToRec();
+}
+
+function frame(now) {
+  const dt = Math.min(.05, (now - last) / 1000); last = now;
+  if (!paused) tau += dt * P.speed;
+  phiDeg = P.position;
+  if (!paused || dirty) { render(); dirty = false; }
+  requestAnimationFrame(frame);
+}
+
+function fit() { const s = Math.min(innerWidth, innerHeight); cv.style.width = cv.style.height = s + 'px'; }
+addEventListener('resize', fit);
+
+for (const id of ids) {
+  const el = document.getElementById(id);
+  el.addEventListener('input', () => { readControls(); dirty = true; });
+  if (id === 'density' || id === 'blur') el.addEventListener('change', () => { readControls(); build(); render(); });
+}
+addEventListener('keydown', e => { if (e.key === 'h' || e.key === 'H') document.body.classList.toggle('hidden'); });
+document.getElementById('pause').onclick = e => { paused = !paused; e.target.textContent = paused ? 'Play' : 'Pause'; };
+
+const download = (blob, file) => {
+  const l = document.createElement('a'); l.href = URL.createObjectURL(blob);
+  l.download = file; l.click(); setTimeout(() => URL.revokeObjectURL(l.href), 1000);
+};
+document.getElementById('save').onclick = () => cv.toBlob(b => download(b, 'frozen-living-drop.png'));
+
+// ---- Record (click again to stop) ----
+const rc = document.createElement('canvas'), rctx = rc.getContext('2d');
+const recBtn = document.getElementById('rec'), vbg = document.getElementById('vbg');
+let rec = null;
+function copyToRec() {
+  if (!rec) return;
+  rctx.clearRect(0, 0, W, W);
+  if (vbg.value) { rctx.fillStyle = vbg.value; rctx.fillRect(0, 0, W, W); }
+  rctx.drawImage(cv, 0, 0);
+}
+recBtn.onclick = () => {
+  if (rec) { rec.stop(); return; }
+  const type = ['video/webm;codecs=vp9', 'video/webm;codecs=vp8', 'video/webm', 'video/mp4']
+    .find(t => window.MediaRecorder && MediaRecorder.isTypeSupported(t));
+  if (!type) { alert('Video recording is not supported in this browser. Try Chrome.'); return; }
+  rc.width = rc.height = W;
+  const chunks = [];
+  rec = new MediaRecorder(rc.captureStream(30), { mimeType: type, videoBitsPerSecond: 12e6 });
+  rec.ondataavailable = e => { if (e.data.size) chunks.push(e.data); };
+  rec.onstop = () => {
+    download(new Blob(chunks, { type }), 'frozen-living-drop' + (type.includes('mp4') ? '.mp4' : '.webm'));
+    rec = null; recBtn.textContent = 'Record';
+  };
+  copyToRec(); rec.start(); recBtn.textContent = 'Stop';
+};
+
+readControls(); build(); fit(); requestAnimationFrame(frame);
+</script>
+</body>
+</html>

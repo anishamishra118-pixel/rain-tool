@@ -1,0 +1,284 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Untouched Drop</title>
+<style>
+  html,body{margin:0;height:100%;background:#fff}
+  body{display:flex;align-items:center;justify-content:center;overflow:hidden;font:11px/1 Helvetica,Arial,sans-serif;color:#000}
+  canvas{display:block}
+  .panel{position:fixed;left:16px;bottom:16px;display:grid;grid-template-columns:auto 120px 36px;gap:8px 10px;align-items:center;letter-spacing:.08em;text-transform:uppercase}
+  .panel input[type=range]{width:120px;accent-color:#000}
+  .panel output{text-align:right;font-variant-numeric:tabular-nums}
+  .ui{position:fixed;right:16px;bottom:16px;display:flex;gap:8px}
+  button,select{background:none;border:1px solid #000;color:#000;padding:6px 12px;font:inherit;letter-spacing:.08em;text-transform:uppercase;cursor:pointer;white-space:nowrap}
+  select{padding:5px 8px}
+  button:hover{background:#000;color:#fff}
+  .hidden .panel,.hidden .ui{display:none}
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+
+<div class="panel">
+  <span>Breathe</span><input type="range" id="breathe" min="0" max="1" step="0.01" value="0.35"><output></output>
+  <span>Creep</span><input type="range" id="creep" min="0" max="80" step="1" value="30"><output></output>
+  <span>Swell</span><input type="range" id="swell" min="0" max="0.9" step="0.01" value="0.3"><output></output>
+  <span>Loose</span><input type="range" id="loose" min="0" max="1" step="0.01" value="0.5"><output></output>
+  <span>Blur</span><input type="range" id="blur" min="8" max="70" step="1" value="30"><output></output>
+  <span>Haze</span><input type="range" id="haze" min="0.1" max="0.9" step="0.01" value="0.26"><output></output>
+  <span>Motion</span><input type="range" id="motion" min="0" max="3" step="0.05" value="1"><output></output>
+  <span>Speed</span><input type="range" id="speed" min="0" max="3" step="0.05" value="0.6"><output></output>
+  <span>Position</span><input type="range" id="position" min="0" max="360" step="1" value="0"><output></output>
+</div>
+
+<div class="ui">
+  <button id="pause">Pause</button>
+  <button id="save">Save PNG</button>
+  <select id="vbg"><option value="#fff">White bg</option><option value="">Transparent (Chrome)</option></select>
+  <button id="rec">Record</button>
+</div>
+
+<script>
+// Press H to hide/show the controls.
+
+// ---- Form (canvas pixels; angles are screen degrees, 0 = right, 90 = bottom) ----
+const W = 1200, CX = 600, CY = 600;
+const R = 360;            // radius
+const STROKE = 13;        // line thickness
+// Haze profile, measured from the drawing: a smooth grey band centred on the line, ~25% grey at its peak,
+// about 0.22 R across at half strength; it narrows and darkens into the line at its ends
+const HZ_OFF = 0, HZ_SD = .78;                   // offset and spread (× Blur); particles left unblurred
+const DENSITY = 1;        // particle density multiplier
+const M = 2048;           // samples round the outline per frame
+
+const rad = d => d * Math.PI / 180;
+const smooth = (a, b, x) => { x = Math.min(1, Math.max(0, (x - a) / (b - a))); return x * x * (3 - 2 * x); };
+const band = (x, a, b, r) => smooth(a, a + r, x) * (1 - smooth(b - r, b, x));
+const norm360 = d => ((d % 360) + 360) % 360;
+
+// Where the line dissolves into haze: a left arc and a right arc. Each of the four meeting points
+// between line and haze drifts on its own irregular rhythm, so the haze grows out of those edges and recedes.
+const BASE = [182, 275, -7, 108], EDGE = [...BASE];   // upper-left arc and lower-right arc, as drawn
+function arc(deg, a, b, r) {                       // band from a to b (degrees), wherever it sits on the circle
+  const c = (a + b) / 2; let d = norm360(deg - c); if (d > 180) d -= 360;
+  return band(c + d, a, b, r);
+}
+function blurEnv(deg) { return Math.max(arc(deg, EDGE[0], EDGE[1], 16), arc(deg, EDGE[2], EDGE[3], 20)); }
+const rnd3 = () => [Math.random() * 6.28, Math.random() * 6.28, Math.random() * 6.28];
+const ESEED = [rnd3(), rnd3(), rnd3(), rnd3()];
+const wobble = (t, p) => (Math.sin(t * .37 + p[0]) + .6 * Math.sin(t * .91 + p[1]) + .35 * Math.sin(t * 1.73 + p[2])) / 1.95;
+// The four meeting points between line and haze drift on their own irregular rhythms: the haze grows and recedes in place
+function moveEdges(t) {
+  EDGE[0] = BASE[0] - P.creep * wobble(t, ESEED[0]); EDGE[1] = BASE[1] + P.creep * wobble(t, ESEED[1]);
+  EDGE[2] = BASE[2] - P.creep * wobble(t, ESEED[2]); EDGE[3] = BASE[3] + P.creep * wobble(t, ESEED[3]);
+}
+const cv = document.getElementById('c'), ctx = cv.getContext('2d');
+cv.width = cv.height = W;
+const img = ctx.createImageData(W, W), u32 = new Uint32Array(img.data.buffer), acc = new Float32Array(W * W), accH = new Float32Array(W * W), tmpH = new Float32Array(W * W);
+
+const P = {};
+const ids = ['breathe', 'creep', 'swell', 'loose', 'blur', 'haze', 'motion', 'speed', 'position'];
+function readControls() {
+  for (const id of ids) { const el = document.getElementById(id); P[id] = +el.value; el.nextElementSibling.textContent = P[id]; }
+}
+const gauss = () => { let u = 0, v = 0; while (!u) u = Math.random(); while (!v) v = Math.random();
+  return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * v); };
+
+// ---- Per-frame outline table ----
+const LX = new Float32Array(M), LY = new Float32Array(M), NX = new Float32Array(M), NY = new Float32Array(M);
+const TH = new Float32Array(M), SP = new Float32Array(M), BL = new Float32Array(M), RR = new Float32Array(M);
+const HX = new Float32Array(M), HY = new Float32Array(M), KP = new Float32Array(M);   // smoothed normals for the haze (no fanning at corners)
+const SW = new Float32Array(M);
+// barely breathing: a slow, faint swell of the whole ring plus the faintest ripples
+const JM = [[2, -.31, .006], [3, .23, .004], [5, -.17, .002]].map(([k, w, a]) => [k, w, a, Math.random() * 6.28]);
+const SM = [[2, .23], [3, .41], [4, .29]].map(([k, w]) => [k, w, Math.random() * 6.28]);
+
+function buildOutline(t) {
+  moveEdges(t);
+  const breath = P.breathe * .012 * Math.sin(t * .45);
+  const sw = P.swell / 2.2;
+  for (let j = 0; j < M; j++) {
+    const a = j / M * 2 * Math.PI;
+    let r = 1 + breath;
+    for (const [k, w, amp, ph] of JM) r += P.breathe * amp * Math.sin(k * a + w * t + ph);
+    r *= R;
+    LX[j] = CX + r * Math.cos(a); LY[j] = CY + r * Math.sin(a);
+    NX[j] = Math.cos(a); NY[j] = Math.sin(a); SP[j] = r; TH[j] = STROKE;
+    BL[j] = blurEnv(j / M * 360);
+    let pulse = 0; for (const [k, w, ph] of SM) pulse += Math.sin(k * a + w * t + ph);
+    SW[j] = Math.max(.5, 1 + sw * pulse);        // uneven outward swell of the haze
+  }
+  const K = 40;
+  for (let j = 0; j < M; j++) {
+    let sx = 0, sy = 0;
+    for (let k = -K; k <= K; k += 4) { const q = (j + k + M) % M; sx += NX[q]; sy += NY[q]; }
+    const l = Math.hypot(sx, sy) || 1; HX[j] = sx / l; HY[j] = sy / l;
+  }
+  // how much the haze spreads or bunches as it moves out from the line (stops dark streaks on inward bends)
+  const s0 = 50;
+  for (let j = 0; j < M; j++) {
+    const q = (j + 1) % M;
+    const d0 = Math.hypot(LX[q] - LX[j], LY[q] - LY[j]) || 1e-3;
+    const d1 = Math.hypot(LX[q] + HX[q] * s0 - LX[j] - HX[j] * s0, LY[q] + HY[q] * s0 - LY[j] - HY[j] * s0);
+    KP[j] = (d1 / d0 - 1) / s0;
+  }
+}
+
+// ---- Particles ----
+let NS, NHZ, sA, sU, sW, sG, sJ, sS, hA, hN, hW, hG, hJs, hJc;
+const GROUPS = 8, OM = Array.from({ length: GROUPS }, (_, g) => .8 + g * .3);
+function build() {
+  NS = Math.round(DENSITY * 2.4 * 2 * Math.PI * R * STROKE);       // the line
+  NHZ = Math.round(DENSITY * 9 * 2 * Math.PI * R * 30);          // the haze
+  sA = new Float32Array(NS); sU = new Float32Array(NS); sW = new Float32Array(NS); sG = new Uint8Array(NS); sJ = new Float32Array(NS); sS = new Float32Array(NS);
+  hA = new Float32Array(NHZ); hN = new Float32Array(NHZ); hW = new Float32Array(NHZ); hG = new Uint8Array(NHZ);
+  hJs = new Float32Array(NHZ); hJc = new Float32Array(NHZ);
+  for (let i = 0; i < NS; i++) {
+    sA[i] = Math.random(); sU[i] = Math.random() - .5;
+    sW[i] = (Math.random() - .5) * .02;                          // drift along the line, both ways
+    sG[i] = (Math.random() * GROUPS) | 0; sJ[i] = Math.random() * 6.28;
+    sS[i] = gauss() * (Math.random() < .12 ? 2.5 : 1);           // scatter; a few strays wander further
+  }
+  for (let i = 0; i < NHZ; i++) {
+    hA[i] = Math.random(); hN[i] = gauss();
+    hW[i] = (Math.random() - .5) * .012; hG[i] = (Math.random() * GROUPS) | 0;
+    const j = Math.random() * 6.28; hJs[i] = Math.sin(j); hJc[i] = Math.cos(j);
+  }
+}
+
+function splatH(x, y, w) {
+  const x0 = x | 0, y0 = y | 0;
+  if (x0 < 0 || y0 < 0 || x0 >= W - 1 || y0 >= W - 1) return;
+  const fx = x - x0, fy = y - y0, i = y0 * W + x0;
+  accH[i] += w * (1 - fx) * (1 - fy); accH[i + 1] += w * fx * (1 - fy);
+  accH[i + W] += w * (1 - fx) * fy; accH[i + W + 1] += w * fx * fy;
+}
+// box blur (horizontal then vertical) so the haze reads as a smooth grey, not grain
+function softenHaze(r) {
+  const k = 1 / (2 * r + 1);
+  for (let y = 0; y < W; y++) {
+    const o = y * W; let s = 0;
+    for (let x = -r; x <= r; x++) s += accH[o + Math.min(W - 1, Math.max(0, x))];
+    for (let x = 0; x < W; x++) {
+      tmpH[o + x] = s * k;
+      s += accH[o + Math.min(W - 1, x + r + 1)] - accH[o + Math.max(0, x - r)];
+    }
+  }
+  for (let x = 0; x < W; x++) {
+    let s = 0;
+    for (let y = -r; y <= r; y++) s += tmpH[Math.min(W - 1, Math.max(0, y)) * W + x];
+    for (let y = 0; y < W; y++) {
+      accH[y * W + x] = s * k;
+      s += tmpH[Math.min(W - 1, y + r + 1) * W + x] - tmpH[Math.max(0, y - r) * W + x];
+    }
+  }
+}
+
+function splat(x, y, w) {
+  const x0 = x | 0, y0 = y | 0;
+  if (x0 < 0 || y0 < 0 || x0 >= W - 1 || y0 >= W - 1) return;
+  const fx = x - x0, fy = y - y0, i = y0 * W + x0;
+  acc[i] += w * (1 - fx) * (1 - fy); acc[i + 1] += w * fx * (1 - fy);
+  acc[i + W] += w * (1 - fx) * fy; acc[i + W + 1] += w * fx * fy;
+}
+
+const cg = new Float32Array(GROUPS), sg = new Float32Array(GROUPS);
+let tau = 0, last = performance.now(), paused = false, dirty = false;
+
+function render() {
+  buildOutline(tau);
+  for (let g = 0; g < GROUPS; g++) { cg[g] = Math.cos(OM[g] * tau); sg[g] = Math.sin(OM[g] * tau); }
+  const off = P.position / 360, mo = P.motion, sig = P.blur, TWO_PI = 2 * Math.PI;
+  const rot = rad(P.position), cr = Math.cos(rot), sr = Math.sin(rot);
+  const place = (x, y) => [CX + (x - CX) * cr - (y - CY) * sr, CY + (x - CX) * sr + (y - CY) * cr];
+  acc.fill(0);
+
+  // the line: solid where crisp, fading out where the haze takes over
+  const ws = 1.7 * TWO_PI / NS;
+  for (let i = 0; i < NS; i++) {
+    let a = (sA[i] + sW[i] * mo * tau) % 1; if (a < 0) a += 1;
+    const j = (a * M) | 0, vis = Math.pow(1 - BL[j], 1.3);   // line softens and hands over to the haze
+    if (vis < .02) continue;
+    const g = sG[i], u = sU[i] + .06 * mo * Math.sin(sJ[i] + OM[g] * tau) * (Math.abs(sU[i]) < .4 ? 1 : 0);
+    // loose: a light scatter all along the line, opening up as it nears the haze
+    const loose = P.loose * (1.2 + 22 * Math.pow(BL[j], .7));
+    const th = TH[j], n = u * th + sS[i] * loose * (Math.abs(sU[i]) > .3 ? 1 : .35);
+    const [x, y] = place(LX[j] + NX[j] * n, LY[j] + NY[j] * n);
+    splat(x, y, vis * ws * SP[j] * th);
+  }
+
+  // the haze: soft grey band in the blurred arcs
+  const wh = TWO_PI * 2.5066 / NHZ, A = 2 * mo;
+  accH.fill(0);
+  for (let i = 0; i < NHZ; i++) {
+    let a = (hA[i] + hW[i] * mo * tau) % 1; if (a < 0) a += 1;
+    const j = (a * M) | 0, b = BL[j];
+    if (b < .02) continue;
+    const g = hG[i], ca = cg[g], sa = sg[g];
+    const sd = HZ_SD * sig * SW[j] * (.25 + .75 * b);          // narrows toward its ends
+    const n = HZ_OFF * sig * b * SW[j] + hN[i] * sd;
+    const [x, y] = place(LX[j] + HX[j] * n + A * (hJc[i] * ca - hJs[i] * sa), LY[j] + HY[j] * n + A * (hJs[i] * ca + hJc[i] * sa));
+    const tone = P.haze + (1 - P.haze) * (1 - b);   // grey in the middle, darkening to black where it folds into the line
+    splatH(x, y, tone * wh * SP[j] * sd / (1 + n / R));
+  }
+
+  for (let i = 0, n = W * W; i < n; i++) acc[i] += accH[i];
+  for (let i = 0, n = W * W; i < n; i++) {
+    const v = acc[i];
+    u32[i] = v <= 0 ? 0 : (v >= 1 ? 255 : (v * 255) | 0) << 24;   // black, alpha = density
+  }
+  ctx.putImageData(img, 0, 0);
+  copyToRec();
+}
+
+function frame(now) {
+  const dt = Math.min(.05, (now - last) / 1000); last = now;
+  if (!paused) tau += dt * P.speed;
+  if (!paused || dirty) { render(); dirty = false; }
+  requestAnimationFrame(frame);
+}
+
+function fit() { const s = Math.min(innerWidth, innerHeight); cv.style.width = cv.style.height = s + 'px'; }
+addEventListener('resize', fit);
+for (const id of ids) document.getElementById(id).addEventListener('input', () => { readControls(); dirty = true; });
+addEventListener('keydown', e => { if (e.key === 'h' || e.key === 'H') document.body.classList.toggle('hidden'); });
+document.getElementById('pause').onclick = e => { paused = !paused; e.target.textContent = paused ? 'Play' : 'Pause'; };
+
+const download = (blob, file) => {
+  const l = document.createElement('a'); l.href = URL.createObjectURL(blob);
+  l.download = file; l.click(); setTimeout(() => URL.revokeObjectURL(l.href), 1000);
+};
+document.getElementById('save').onclick = () => cv.toBlob(b => download(b, 'untouched-drop.png'));
+
+// ---- Record (click again to stop) ----
+const rc = document.createElement('canvas'), rctx = rc.getContext('2d');
+const recBtn = document.getElementById('rec'), vbg = document.getElementById('vbg');
+let rec = null;
+function copyToRec() {
+  if (!rec) return;
+  rctx.clearRect(0, 0, W, W);
+  if (vbg.value) { rctx.fillStyle = vbg.value; rctx.fillRect(0, 0, W, W); }
+  rctx.drawImage(cv, 0, 0);
+}
+recBtn.onclick = () => {
+  if (rec) { rec.stop(); return; }
+  const type = ['video/webm;codecs=vp9', 'video/webm;codecs=vp8', 'video/webm', 'video/mp4']
+    .find(t => window.MediaRecorder && MediaRecorder.isTypeSupported(t));
+  if (!type) { alert('Video recording is not supported in this browser. Try Chrome.'); return; }
+  rc.width = rc.height = W;
+  const chunks = [];
+  rec = new MediaRecorder(rc.captureStream(30), { mimeType: type, videoBitsPerSecond: 12e6 });
+  rec.ondataavailable = e => { if (e.data.size) chunks.push(e.data); };
+  rec.onstop = () => {
+    download(new Blob(chunks, { type }), 'untouched-drop' + (type.includes('mp4') ? '.mp4' : '.webm'));
+    rec = null; recBtn.textContent = 'Record';
+  };
+  copyToRec(); rec.start(); recBtn.textContent = 'Stop';
+};
+
+readControls(); build(); fit(); requestAnimationFrame(frame);
+</script>
+</body>
+</html>

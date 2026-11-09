@@ -1,0 +1,34 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Rain Drops</title>
+<style>
+  :root { --bg: #fff; --ink: #000; --muted: #777; }
+  html, body { margin: 0; background: var(--bg); color: var(--ink); }
+  body { font: 13px/1.5 Helvetica, Arial, sans-serif; padding: 48px 16px; max-width: 760px; margin: 0 auto; }
+  h1 { font-size: 13px; font-weight: normal; letter-spacing: .08em; text-transform: uppercase; margin: 0 0 6px; }
+  p { color: var(--muted); margin: 0 0 40px; }
+  ol { list-style: none; padding: 0; margin: 0; border-top: 1px solid var(--ink); }
+  li { display: grid; grid-template-columns: 1fr auto; gap: 4px 16px; padding: 14px 0; border-bottom: 1px solid var(--ink); }
+  li span { color: var(--muted); grid-column: 1 / -1; }
+  li b { font-weight: normal; letter-spacing: .08em; text-transform: uppercase; }
+  li nav { display: flex; gap: 12px; }
+  a { color: var(--ink); }
+</style>
+</head>
+<body>
+<h1>Rain Drops</h1>
+<p>Generative particle studies of a raindrop's life. Each piece as the original HTML tool and recreated in p5.js. Press H in any piece to hide its controls.</p>
+<ol>
+  <li><b>Snow drop</b><nav><a href="originals/snow-drop.html">Original</a><a href="p5/snow-drop/">p5.js</a></nav><span>Snowflake arms grow out from the ring; crystals grow inward to a hollow.</span></li>
+  <li><b>Sleet drop</b><nav><a href="originals/sleet-drop.html">Original</a><a href="p5/sleet-drop/">p5.js</a></nav><span>Refreezing from the outside in: ice shell, shrinking core, spikes, cracks.</span></li>
+  <li><b>Land drop</b><nav><a href="originals/land-drop.html">Original</a><a href="p5/land-drop/">p5.js</a></nav><span>Reaching land: splash crown, spray, soak-in stain, petrichor.</span></li>
+  <li><b>Frozen living drop</b><nav><a href="originals/frozen-living-drop.html">Original</a><a href="p5/frozen-living-drop/">p5.js</a></nav><span>A solid drop that keeps moving; crisp edges and soft, creeping edges.</span></li>
+  <li><b>Pressure drop</b><nav><a href="originals/pressure-drop.html">Original</a><a href="p5/pressure-drop/">p5.js</a></nav><span>Under pressure and resistance: stretched to a distorted U, then eased back.</span></li>
+  <li><b>Untouched drop</b><nav><a href="originals/untouched-drop.html">Original</a><a href="p5/untouched-drop/">p5.js</a></nav><span>Untouched by air pressure or resistance: a barely breathing ring and haze.</span></li>
+  <li><b>Thaw drop</b><nav><a href="originals/thaw-drop.html">Original</a><a href="p5/thaw-drop/">p5.js</a></nav><span>Frozen → Thaw → Split, on one slider. Slice the thawed ring with the cursor.</span></li>
+</ol>
+</body>
+</html>

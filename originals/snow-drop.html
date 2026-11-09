@@ -1,0 +1,294 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Crystallizing Drop</title>
+<style>
+  html,body{margin:0;height:100%;background:#5f5f5f}
+  body{display:flex;align-items:center;justify-content:center;overflow:hidden;font:11px/1 Helvetica,Arial,sans-serif;color:#000}
+  canvas{display:block}
+  .ui{position:fixed;bottom:16px;left:50%;transform:translateX(-50%);display:flex;gap:8px}
+  button{background:none;border:1px solid #000;color:#000;padding:6px 12px;font:inherit;letter-spacing:.08em;text-transform:uppercase;cursor:pointer}
+  button:hover{background:#000;color:#5f5f5f}
+  button,select{white-space:nowrap;flex:none}
+  select{background:none;border:1px solid #000;color:#000;padding:5px 8px;font:inherit;letter-spacing:.08em;text-transform:uppercase}
+  .panel{position:fixed;top:16px;left:16px;display:grid;grid-template-columns:auto 120px 32px;gap:8px 10px;align-items:center;letter-spacing:.08em;text-transform:uppercase}
+  .panel input[type=range]{width:120px;accent-color:#000}
+  .panel output{text-align:right;font-variant-numeric:tabular-nums}
+  .panel .chk{grid-column:1 / -1;display:flex;gap:6px;align-items:center}
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+
+<div class="panel">
+  <span>Blur</span><input type="range" id="blur" min="0" max="40" step="0.5" value="14"><output></output>
+  <span>Position</span><input type="range" id="pos" min="0" max="1" step="0.01" value="0.5"><output></output>
+  <span>Focus</span><input type="range" id="focus" min="0" max="500" step="1" value="170"><output></output>
+  <span>Transition</span><input type="range" id="trans" min="0" max="500" step="1" value="220"><output></output>
+  <span>Angle</span><input type="range" id="angle" min="-90" max="90" step="1" value="0"><output></output>
+  <label class="chk"><input type="checkbox" id="guides"> Show guides</label>
+</div>
+
+<div class="ui"><button id="restart">Restart</button><button id="save">Save PNG</button><select id="vbg"><option value="#fff">White bg</option><option value="#5f5f5f">Grey bg</option><option value="">Transparent (Chrome)</option></select><button id="rec">Record</button></div>
+
+<script>
+// ---- Form ----
+const BG = '#5f5f5f';
+const S = 1000;          // design space (square)
+const CX = 500, CY = 500;
+const R = 260;           // ring radius
+const OFF = 55;          // smear offset at top/bottom
+const ARMS = 84;         // number of main snowflake arms
+const GROW = 14;         // arm growth speed (units/sec) — lower = slower
+const SPREAD = 14;       // seconds for frost to travel from top to bottom
+const LEVELS = 4;        // blur steps across the transition zone
+
+const cv = document.getElementById('c'), ctx = cv.getContext('2d');
+const mk = () => { const c = document.createElement('canvas'); return [c, c.getContext('2d')]; };
+const [base, bctx] = mk(), [scene, sctx] = mk(), [half, hctx] = mk(), [tmp, tctx] = mk();
+let k, sz, pts, idx, t0, raf;
+
+// ---- Tilt-blur controls ----
+const P = {};
+const ids = ['blur', 'pos', 'focus', 'trans', 'angle'];
+function readControls() {
+  for (const id of ids) {
+    const el = document.getElementById(id);
+    P[id] = +el.value;
+    el.nextElementSibling.textContent = id === 'pos' ? Math.round(P[id] * 100) : P[id];
+  }
+  P.guides = document.getElementById('guides').checked;
+}
+for (const id of [...ids, 'guides']) document.getElementById(id).addEventListener('input', () => { readControls(); composite(); });
+
+const gauss = () => { let u = 0, v = 0; while (!u) u = Math.random(); while (!v) v = Math.random();
+  return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * v); };
+const smooth = (a, b, x) => { x = Math.min(1, Math.max(0, (x - a) / (b - a))); return x * x * (3 - 2 * x); };
+const env = a => { const s = Math.sin(a); return s < 0 ? -smooth(.5, .9, -s) : smooth(.5, .9, s); };
+
+function drawBase() {
+  bctx.setTransform(1, 0, 0, 1, 0, 0);
+  bctx.clearRect(0, 0, base.width, base.height);
+  bctx.setTransform(k, 0, 0, k, 0, 0);
+  bctx.fillStyle = '#000';
+  for (let i = 0; i < 70000; i++) {
+    const a = Math.random() * Math.PI * 2, al = .85 * (1 - Math.abs(env(a)));
+    if (al < .02) continue;
+    const r = R + gauss() * 1.6;
+    bctx.globalAlpha = al;
+    bctx.fillRect(CX + Math.cos(a) * r, CY + Math.sin(a) * r, sz, sz);
+  }
+  for (let i = 0; i < 120000; i++) {
+    const a = Math.random() * Math.PI * 2, e = env(a);
+    if (Math.abs(e) < .02) continue;
+    const u = Math.pow(Math.random(), .6);
+    bctx.globalAlpha = .1 * Math.abs(e);
+    bctx.fillRect(CX + Math.cos(a) * R + gauss() * 3,
+                  CY + Math.sin(a) * R + e * OFF * u + gauss() * (4 + 10 * u), sz, sz);
+  }
+  bctx.globalAlpha = 1;
+}
+
+// irregular hollow at the centre that inward crystals stop short of
+const CORE = .34;
+const waves = [2, 3, 5, 7, 11].map(f => ({ f, p: Math.random() * 6.28, amp: .1 / Math.sqrt(f) }));
+const coreR = a => R * CORE * (1 + waves.reduce((s, w) => s + w.amp * Math.sin(w.f * a + w.p), 0));
+const ARMS_IN = 180;     // crystals growing inward from the ring
+
+function grow(x, y, dir, len, birth, depth, maxD = 2) {
+  const cs = Math.cos(dir), sn = Math.sin(dir), nx = -sn, ny = cs;
+  const gap = len * (.16 + Math.random() * .08);
+  let next = gap * (.6 + Math.random() * .4);
+  for (let d = 0; d < len; d += 1) {
+    const f = 1 - d / len, w = (depth ? .8 : 1.6) * f + .3;
+    const bx = x + cs * d, by = y + sn * d, b = birth + d / GROW;
+    for (let j = 0, n = depth ? 2 : 3; j < n; j++) {
+      const o = gauss() * w;
+      pts.push({ x: bx + nx * o + gauss() * .3, y: by + ny * o + gauss() * .3, b, a: .5 + .4 * f });
+    }
+    if (depth < maxD && d >= next && d < len * .85) {
+      const bl = (len - d) * (.35 + Math.random() * .2);
+      grow(bx, by, dir + Math.PI / 3, bl, b, depth + 1, maxD);
+      grow(bx, by, dir - Math.PI / 3, bl * (.85 + Math.random() * .3), b, depth + 1, maxD);
+      next += gap;
+    }
+  }
+}
+
+function buildArms() {
+  pts = [];
+  for (let i = 0; i < ARMS; i++) {
+    const a = (i + Math.random() * .6) / ARMS * Math.PI * 2, e = env(a);
+    const x = CX + Math.cos(a) * R, y = CY + Math.sin(a) * R + e * OFF;
+    const fromTop = Math.acos(-Math.sin(a)) / Math.PI;
+    const delay = 1 + fromTop * SPREAD + Math.random() * 1.5;
+    const len = 30 + Math.random() * 55 + Math.abs(e) * 25;
+    grow(x, y, a, len, delay, 0);
+  }
+  // inward crystals: start at the ring, reach toward the hollow core
+  for (let i = 0; i < ARMS_IN; i++) {
+    const a = (i + Math.random()) / ARMS_IN * Math.PI * 2;
+    const x = CX + Math.cos(a) * (R - 2), y = CY + Math.sin(a) * (R - 2);
+    const fromTop = Math.acos(-Math.sin(a)) / Math.PI;
+    const delay = 2 + fromTop * SPREAD + Math.random() * 3;
+    const len = (R - coreR(a)) * (.55 + Math.random() * .45);
+    grow(x, y, a + Math.PI, len, delay, 0, Math.random() < .3 ? 2 : 1);
+  }
+  // keep inward growth inside the ring and outside the hollow
+  pts = pts.filter(p => {
+    const dx = p.x - CX, dy = p.y - CY, r = Math.hypot(dx, dy);
+    return r > R - 2 || r >= coreR(Math.atan2(dy, dx));
+  });
+  pts.sort((p, q) => p.b - q.b);
+}
+
+// ---- Tilt blur: sharp band, blur ramps up through the transition zone ----
+function bandGeom() {
+  const W = cv.width, th = P.angle * Math.PI / 180;
+  return { W, cx: W / 2, cy: P.pos * W, dx: Math.cos(th), dy: Math.sin(th), nx: -Math.sin(th), ny: Math.cos(th), D: W * 1.5 };
+}
+
+// Each blur level gets a weight across the band; weights sum to 1, so levels
+// cross-fade cleanly on a transparent background.
+function mask(i, g) {
+  const D = g.D, t = j => Math.min(D, (P.focus + P.trans * j / LEVELS) * k);
+  let pts;
+  if (i === 0) pts = [[0, 1], [t(0), 1], [t(1), 0], [D, 0]];
+  else if (i === LEVELS) pts = [[0, 0], [t(i - 1), 0], [t(i), 1], [D, 1]];
+  else pts = [[0, 0], [t(i - 1), 0], [t(i), 1], [t(i + 1), 0], [D, 0]];
+  const o = d => Math.min(1, Math.max(0, .5 + d / (2 * D)));
+  const gr = tctx.createLinearGradient(g.cx - g.nx * D, g.cy - g.ny * D, g.cx + g.nx * D, g.cy + g.ny * D);
+  for (let j = pts.length - 1; j >= 0; j--) gr.addColorStop(o(-pts[j][0]), `rgba(0,0,0,${pts[j][1]})`);
+  for (const [d, a] of pts) gr.addColorStop(o(d), `rgba(0,0,0,${a})`);
+  return gr;
+}
+
+function composite(showGuides = P.guides) {
+  const g = bandGeom(), W = g.W, hw = half.width;
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.globalCompositeOperation = 'source-over';
+  ctx.clearRect(0, 0, W, W);
+  if (P.blur <= 0) { ctx.drawImage(scene, 0, 0); copyToRec(); if (showGuides) drawGuides(g); return; }
+  for (let i = 0; i <= LEVELS; i++) {
+    tctx.globalCompositeOperation = 'source-over';
+    tctx.clearRect(0, 0, W, W);
+    if (i === 0) tctx.drawImage(scene, 0, 0);
+    else {
+      hctx.filter = 'none'; hctx.clearRect(0, 0, hw, hw);
+      hctx.filter = `blur(${P.blur * k * i / LEVELS * (hw / W)}px)`;
+      hctx.drawImage(scene, 0, 0, hw, hw);
+      tctx.drawImage(half, 0, 0, W, W);
+    }
+    tctx.globalCompositeOperation = 'destination-in';
+    tctx.fillStyle = mask(i, g); tctx.fillRect(0, 0, W, W);
+    ctx.globalCompositeOperation = 'lighter';
+    ctx.drawImage(tmp, 0, 0);
+  }
+  ctx.globalCompositeOperation = 'source-over';
+  copyToRec();
+  if (showGuides) drawGuides(g);
+}
+
+function drawGuides(g) {
+  const line = d => {
+    const px = g.cx + g.nx * d, py = g.cy + g.ny * d;
+    ctx.beginPath(); ctx.moveTo(px - g.dx * g.D, py - g.dy * g.D); ctx.lineTo(px + g.dx * g.D, py + g.dy * g.D); ctx.stroke();
+  };
+  const dpr = window.devicePixelRatio || 1;
+  ctx.strokeStyle = '#fff'; ctx.lineWidth = dpr;
+  ctx.setLineDash([]); line(-P.focus * k); line(P.focus * k);
+  ctx.setLineDash([6 * dpr, 6 * dpr]); line(-(P.focus + P.trans) * k); line((P.focus + P.trans) * k);
+  ctx.setLineDash([]);
+  ctx.beginPath(); ctx.arc(g.cx, g.cy, 5 * dpr, 0, Math.PI * 2); ctx.stroke();
+}
+
+// ---- Animation ----
+function frame(now) {
+  const t = (now - t0) / 1000;
+  let added = false;
+  sctx.fillStyle = '#000';
+  while (idx < pts.length && pts[idx].b <= t) {
+    const p = pts[idx++];
+    sctx.globalAlpha = p.a;
+    sctx.fillRect(p.x, p.y, sz, sz);
+    added = true;
+  }
+  sctx.globalAlpha = 1;
+  if (added) composite();
+  if (idx < pts.length) raf = requestAnimationFrame(frame);
+  else if (rec) endRec();
+}
+
+function restart() {
+  cancelAnimationFrame(raf);
+  buildArms(); idx = 0;
+  sctx.setTransform(1, 0, 0, 1, 0, 0);
+  sctx.clearRect(0, 0, scene.width, scene.height);
+  sctx.drawImage(base, 0, 0);
+  sctx.setTransform(k, 0, 0, k, 0, 0);
+  composite();
+  t0 = performance.now();
+  raf = requestAnimationFrame(frame);
+}
+
+function setup() {
+  const css = Math.min(innerWidth, innerHeight), dpr = window.devicePixelRatio || 1;
+  const px = Math.round(css * dpr);
+  k = px / S; sz = 1.3 / k;
+  cv.width = cv.height = base.width = base.height = scene.width = scene.height = tmp.width = tmp.height = px;
+  half.width = half.height = Math.round(px / 2);
+  cv.style.width = cv.style.height = css + 'px';
+  drawBase(); restart();
+}
+
+document.getElementById('restart').onclick = restart;
+const NAME = document.title.toLowerCase().replace(/ /g, '-');
+const download = (blob, file) => {
+  const l = document.createElement('a'); l.href = URL.createObjectURL(blob);
+  l.download = file; l.click(); setTimeout(() => URL.revokeObjectURL(l.href), 1000);
+};
+document.getElementById('save').onclick = () => {
+  composite(false);
+  cv.toBlob(b => { download(b, NAME + '.png'); composite(); });
+};
+
+// ---- Record the animation (restarts it, stops when growth finishes) ----
+const rc = document.createElement('canvas'), rctx = rc.getContext('2d');
+const recBtn = document.getElementById('rec'), vbg = document.getElementById('vbg');
+let rec = null, ending = false;
+function copyToRec() {
+  if (!rec) return;
+  rctx.clearRect(0, 0, rc.width, rc.height);
+  if (vbg.value) { rctx.fillStyle = vbg.value; rctx.fillRect(0, 0, rc.width, rc.height); }
+  rctx.drawImage(cv, 0, 0);
+}
+function endRec() {
+  if (ending || !rec) return;
+  ending = true;
+  let n = 0;
+  const iv = setInterval(() => { copyToRec(); if (++n > 15) { clearInterval(iv); rec.stop(); } }, 100);
+}
+recBtn.onclick = () => {
+  if (rec) { endRec(); return; }
+  const type = ['video/webm;codecs=vp9', 'video/webm;codecs=vp8', 'video/webm', 'video/mp4']
+    .find(t => window.MediaRecorder && MediaRecorder.isTypeSupported(t));
+  if (!type) { alert('Video recording is not supported in this browser. Try Chrome.'); return; }
+  rc.width = rc.height = cv.width;
+  const chunks = [];
+  rec = new MediaRecorder(rc.captureStream(30), { mimeType: type, videoBitsPerSecond: 12e6 });
+  rec.ondataavailable = e => { if (e.data.size) chunks.push(e.data); };
+  rec.onstop = () => {
+    download(new Blob(chunks, { type }), NAME + (type.includes('mp4') ? '.mp4' : '.webm'));
+    rec = null; ending = false; recBtn.textContent = 'Record';
+  };
+  rec.start(); recBtn.textContent = 'Stop';
+  restart();
+};
+let rt; addEventListener('resize', () => { clearTimeout(rt); rt = setTimeout(setup, 200); });
+readControls();
+setup();
+</script>
+</body>
+</html>

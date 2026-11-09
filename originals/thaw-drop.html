@@ -1,0 +1,555 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Thaw Drop</title>
+<style>
+  html,body{margin:0;height:100%;background:#fff}
+  body{display:flex;align-items:center;justify-content:center;overflow:hidden;font:11px/1 Helvetica,Arial,sans-serif;color:#000}
+  canvas{display:block}
+  .panel{position:fixed;left:16px;top:16px;display:grid;grid-template-columns:auto 120px 36px;gap:8px 10px;align-items:center;letter-spacing:.08em;text-transform:uppercase}
+  .panel input[type=range]{width:120px;accent-color:#000}
+  .panel output{text-align:right;font-variant-numeric:tabular-nums}
+  .ui{position:fixed;right:16px;top:16px;display:flex;gap:8px}
+  .thaw{position:fixed;left:50%;bottom:24px;transform:translateX(-50%);width:min(640px,calc(100vw - 32px));
+        display:grid;grid-template-columns:auto 1fr 44px;gap:14px;align-items:center;letter-spacing:.08em;text-transform:uppercase}
+  .thaw input[type=range]{width:100%;accent-color:#000}
+  .thaw output{text-align:right;font-variant-numeric:tabular-nums}
+  .ticks{display:flex;justify-content:space-between;opacity:.55;font-size:10px;margin-top:-6px}
+  .hidden .thaw{display:none}
+  button,select{background:none;border:1px solid #000;color:#000;padding:6px 12px;font:inherit;letter-spacing:.08em;text-transform:uppercase;cursor:pointer;white-space:nowrap}
+  select{padding:5px 8px}
+  button:hover{background:#000;color:#fff}
+  .hidden .panel,.hidden .ui{display:none}
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+
+<div class="panel">
+  <span>Density</span><input type="range" id="density" min="0.4" max="2.5" step="0.05" value="1"><output></output>
+  <span>Size</span><input type="range" id="size" min="1" max="5" step="0.5" value="2"><output></output>
+  <span>Flux</span><input type="range" id="flux" min="0" max="180" step="1" value="60"><output></output>
+  <span>Creep</span><input type="range" id="creep" min="0" max="80" step="1" value="30"><output></output>
+  <span>Swell</span><input type="range" id="swell" min="0" max="0.9" step="0.01" value="0.35"><output></output>
+  <span>Haze</span><input type="range" id="haze" min="0.1" max="0.9" step="0.01" value="0.26"><output></output>
+  <span>Loose</span><input type="range" id="loose" min="0" max="1" step="0.01" value="0.5"><output></output>
+  <span>Motion</span><input type="range" id="motion" min="0" max="3" step="0.05" value="1"><output></output>
+  <span>Speed</span><input type="range" id="speed" min="0" max="3" step="0.05" value="0.6"><output></output>
+  <span>Position</span><input type="range" id="position" min="0" max="360" step="1" value="0"><output></output>
+</div>
+
+<div class="thaw">
+  <span>Thaw</span><input type="range" id="thaw" min="0" max="2" step="0.001" value="0"><output></output>
+  <span></span><div class="ticks"><span>Frozen</span><span>Thaw</span><span>Split</span></div><span></span>
+</div>
+
+<div class="ui">
+  <button id="pause">Pause</button>
+  <button id="save">Save PNG</button>
+  <select id="vbg"><option value="#fff">White bg</option><option value="">Transparent (Chrome)</option></select>
+  <button id="rec">Record</button>
+</div>
+
+<script>
+// Press H to hide/show the controls.
+// Thaw 0 = the frozen drop (solid disc, soft edges). Thaw 1 = the untouched drop (open ring, grey haze).
+// In between, the disc empties from the edge inward: each particle travels to its place on the ring or in the haze.
+// Thaw 1 → 2 = Split: tension builds (the ring trembles, the haze draws in), then the ring cracks and shatters,
+// its particles flung across the canvas. Slide back and they gather into the ring again.
+// Easter egg: once thawed, slice across the ring quickly with the cursor to split it open yourself.
+
+const W = 1200, CX = 600, CY = 600, M = 2048, TWO_PI = Math.PI * 2;
+// frozen drop
+const BULGE = 2;         // size of the frozen drop's bulges round the rim, and how much they swell (1 = previous)
+const REACH = .5;        // how far the frozen drop's powder disperses (1 = previous reach)
+const RF = 380, BLUR_F = 22, DENS_F = 1.4, INK = 1.6, GROUPS = 8;
+const BASE_F = [100, 268, -45, 42];
+// untouched drop
+const RU = 360, STROKE = 13, BLUR_U = 30, HZ_SD = .78, BREATHE = .35;
+const BASE_U = [182, 275, -7, 108];
+
+const smooth = (a, b, x) => { x = Math.min(1, Math.max(0, (x - a) / (b - a))); return x * x * (3 - 2 * x); };
+const band = (x, a, b, r) => smooth(a, a + r, x) * (1 - smooth(b - r, b, x));
+const norm360 = d => ((d % 360) + 360) % 360;
+const gauss = () => { let u = 0, v = 0; while (!u) u = Math.random(); while (!v) v = Math.random();
+  return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * v); };
+const rnd3 = () => [Math.random() * 6.28, Math.random() * 6.28, Math.random() * 6.28];
+const wobble = (t, p) => (Math.sin(t * .37 + p[0]) + .6 * Math.sin(t * .91 + p[1]) + .35 * Math.sin(t * 1.73 + p[2])) / 1.95;
+
+const P = {};
+const ids = ['thaw', 'density', 'size', 'flux', 'creep', 'swell', 'haze', 'loose', 'motion', 'speed', 'position'];
+function readControls() {
+  for (const id of ids) { const el = document.getElementById(id); P[id] = +el.value; el.nextElementSibling.textContent = P[id]; }
+}
+
+// ---- blurred-edge envelopes (both creep on their own irregular rhythms) ----
+const EF = [...BASE_F], EU = [...BASE_U], SF = [rnd3(), rnd3(), rnd3(), rnd3()], SU = [rnd3(), rnd3(), rnd3(), rnd3()];
+// Frozen drop: the disc itself holds perfectly still. Its soft bulges are random — 3 to 6 of them at a time,
+// each its own size and strength, each running round the edge at its own pace (Flux sets the average),
+// swelling and shrinking as it goes. When one has lived out its time it fades and a new one rises elsewhere.
+let fluxF = 0;
+function moveEdges(t) {
+  const [E, B, S] = [EU, BASE_U, SU];
+  E[0] = B[0] - P.creep * wobble(t, S[0]); E[1] = B[1] + P.creep * wobble(t, S[1]);
+  E[2] = B[2] - P.creep * wobble(t, S[2]); E[3] = B[3] + P.creep * wobble(t, S[3]);
+}
+function arc(deg, a, b, r) { const c = (a + b) / 2; let d = norm360(deg - c); if (d > 180) d -= 360; return band(c + d, a, b, r); }
+const rand = (a, b) => a + Math.random() * (b - a);
+function newBulge(initial) {
+  return { c: rand(0, 360), hw: BULGE * rand(14, 70), amp: rand(.55, 1), dir: Math.random() < .8 ? 1 : -1, pace: rand(.4, 1.7),
+           life: rand(4, 11), age: initial ? rand(0, 6) : 0, seed: rnd3() };
+}
+let bulges = Array.from({ length: 3 }, () => newBulge(true));   // fewer, bigger bulges so crisp edge still shows between them
+function updateBulges(dt, t) {
+  for (let k = 0; k < bulges.length; k++) {
+    const g = bulges[k];
+    g.age += dt;
+    g.c += g.dir * g.pace * P.flux * dt * (1 + .7 * wobble(t * 1.3, g.seed));   // surges and slackens
+    if (g.age > g.life) bulges[k] = newBulge(false);
+  }
+  if (bulges.length < 2) bulges.push(newBulge(false));
+  if (bulges.length < 4 && Math.random() < dt * .08) bulges.push(newBulge(false));
+  if (bulges.length > 2 && Math.random() < dt * .05) bulges.splice((Math.random() * bulges.length) | 0, 1);
+}
+function envF(deg) {
+  let m = 0;
+  for (const g of bulges) {
+    const fade = smooth(0, 1.5, g.age) * (1 - smooth(g.life - 1.5, g.life, g.age));   // rise and fall
+    const hw = g.hw * (1 + BULGE * P.creep / 60 * wobble(tauNow * 1.1, g.seed));    // each one swells and shrinks
+    const v = g.amp * fade * arc(deg, g.c - hw, g.c + hw, Math.min(22, hw * .7));
+    if (v > m) m = v;
+  }
+  return m;
+}
+let tauNow = 0;
+const envU = deg => Math.max(arc(deg, EU[0], EU[1], 16), arc(deg, EU[2], EU[3], 20));
+
+// ---- canvas ----
+const cv = document.getElementById('c'), ctx = cv.getContext('2d');
+cv.width = cv.height = W;
+const img = ctx.createImageData(W, W), u32 = new Uint32Array(img.data.buffer), acc = new Float32Array(W * W);
+// ---- Tiny spheres: each particle is stamped as a round dot with a domed (spherical) profile,
+// anti-aliased at 4×4 sub-pixel positions. Ink per particle is unchanged, so tones stay the same.
+const KCACHE = new Map();
+function kernels(d) {
+  const key = Math.round(d * 4) / 4;
+  if (KCACHE.has(key)) return KCACHE.get(key);
+  const r = key / 2, h = Math.ceil(r + .5), n = 2 * h + 1, set = [];
+  for (let py = 0; py < 4; py++) for (let px = 0; px < 4; px++) {
+    const fx = px / 4, fy = py / 4, k = new Float32Array(n * n); let sum = 0;
+    for (let j = 0; j < n; j++) for (let i = 0; i < n; i++) {
+      let v = 0;                                     // supersample each pixel 4×4
+      for (let sy = 0; sy < 4; sy++) for (let sx = 0; sx < 4; sx++) {
+        const dx = i - h + (sx + .5) / 4 - .5 - fx, dy = j - h + (sy + .5) / 4 - .5 - fy, q = (dx * dx + dy * dy) / (r * r);
+        if (q < 1) v += Math.sqrt(1 - q);            // height of a sphere: denser in the middle, soft at the rim
+      }
+      k[j * n + i] = v; sum += v;
+    }
+    for (let t = 0; t < k.length; t++) k[t] /= sum || 1;
+    set.push(k);
+  }
+  const out = { h, n, set }; KCACHE.set(key, out); return out;
+}
+let KN = null, KB = null;                            // normal and big-speck kernels for this frame
+function splatK(x, y, w, K) {
+  const x0 = Math.floor(x), y0 = Math.floor(y), h = K.h, n = K.n;
+  if (x0 - h < 0 || y0 - h < 0 || x0 + h >= W || y0 + h >= W) return;
+  const k = K.set[(((y - y0) * 4) | 0) * 4 + (((x - x0) * 4) | 0)];
+  let o = (y0 - h) * W + x0 - h, t = 0;
+  for (let j = 0; j < n; j++, o += W) for (let i = 0; i < n; i++, t++) { const v = k[t]; if (v) acc[o + i] += w * v; }
+}
+
+function splat(x, y, w) {
+  const x0 = x | 0, y0 = y | 0;
+  if (x0 < 0 || y0 < 0 || x0 >= W - 1 || y0 >= W - 1) return;
+  const fx = x - x0, fy = y - y0, i = y0 * W + x0;
+  acc[i] += w * (1 - fx) * (1 - fy); acc[i + 1] += w * fx * (1 - fy);
+  acc[i + W] += w * (1 - fx) * fy; acc[i + W + 1] += w * fx * fy;
+}
+
+// ---- particles ----
+// N disc particles + NH frozen-halo particles. Each one also carries a destination in the untouched drop:
+// a place on the ring line (role 1) or in the haze (role 2), at its own angle.
+const phases = (x, y) => [.011 * y + .004 * x, .007 * (x + y), .012 * x - .003 * y, .008 * (x - y) + 1.3];
+const MODES_F = [[2, .23], [3, .41], [5, .67], [7, .53]], MPF = MODES_F.map(() => Math.random() * 6.28);
+let N, NH, T, NL, NZ;
+let hx, hy, ux, uy, fr, S, C, js, jc, grp, st;              // frozen side
+let hc, hs, hu, hdeg, MS, MC;                               // frozen halo
+let role, a0, dr, du, ds, dn, shx, shy, kr;                               // untouched side
+function build() {
+  const D = P.density;
+  N = Math.round(D * DENS_F * Math.PI * RF * RF);
+  NH = Math.round(D * DENS_F * TWO_PI * RF * BLUR_F * .7 * 1.5);   // long-tailed halo (see hu), extra for the drifting powder
+  T = N + NH;
+  NL = Math.round(D * 2.4 * TWO_PI * RU * STROKE);              // particles that become the ring line
+  NZ = T - NL;                                              // the rest become haze (or fade)
+  hx = new Float32Array(T); hy = new Float32Array(T); ux = new Float32Array(T); uy = new Float32Array(T); fr = new Float32Array(T);
+  S = Array.from({ length: 4 }, () => new Float32Array(T)); C = Array.from({ length: 4 }, () => new Float32Array(T));
+  js = new Float32Array(T); jc = new Float32Array(T); grp = new Uint8Array(T); st = new Float32Array(T);
+  hc = new Float32Array(NH); hs = new Float32Array(NH); hu = new Float32Array(NH); hdeg = new Float32Array(NH);
+  MS = MODES_F.map(() => new Float32Array(NH)); MC = MODES_F.map(() => new Float32Array(NH));
+  role = new Uint8Array(T); shx = new Float32Array(T); shy = new Float32Array(T); kr = new Float32Array(T); a0 = new Float32Array(T); dr = new Float32Array(T); du = new Float32Array(T); ds = new Float32Array(T); dn = new Float32Array(T);
+
+  const common = (i, x, y, ang) => {
+    const ph = phases(x, y);
+    for (let k = 0; k < 4; k++) { S[k][i] = Math.sin(ph[k]); C[k][i] = Math.cos(ph[k]); }
+    const j = Math.random() * 6.283; js[i] = Math.sin(j); jc[i] = Math.cos(j); grp[i] = (Math.random() * GROUPS) | 0;
+    a0[i] = ang / TWO_PI;
+    du[i] = Math.random() - .5; ds[i] = gauss() * (Math.random() < .12 ? 2.5 : 1); dn[i] = gauss();
+    // shatter: each particle's flight direction (outward, splayed) and speed (a few fly very far)
+    const fa = ang + gauss() * .55, fv = .2 + 1.15 * Math.pow(Math.random(), .6);
+    shx[i] = Math.cos(fa) * fv; shy[i] = Math.sin(fa) * fv; kr[i] = Math.random();
+  };
+  // choose which disc particles become the line, spread evenly
+  const lineP = NL / N;
+  for (let i = 0; i < N; i++) {
+    const a = Math.random() * TWO_PI, r = RF * Math.sqrt(Math.random());
+    hx[i] = CX + Math.cos(a) * r; hy[i] = CY + Math.sin(a) * r;
+    ux[i] = Math.cos(a); uy[i] = Math.sin(a); fr[i] = 1 - Math.pow(r / RF, 6);
+    st[i] = .45 * (1 - r / RF);                              // the edge lets go first, the core last
+    common(i, hx[i], hy[i], a);
+    if (Math.random() < lineP) { role[i] = 1; dr[i] = (Math.random() - .5) * .02; }
+    else { role[i] = 2; dr[i] = (Math.random() - .5) * .012; }
+  }
+  for (let k = 0; k < NH; k++) {
+    const a = Math.random() * TWO_PI, i = N + k;
+    hc[k] = Math.cos(a); hs[k] = Math.sin(a); hdeg[k] = a * 180 / Math.PI; hu[k] = -Math.log(1 - Math.random() * .9999) * .7 + (Math.random() < .05 ? 1.5 + 4 * Math.random() : 0);   // no hard outer edge: a long tail, a few strays far out
+    MODES_F.forEach(([m], j) => { MS[j][k] = Math.sin(m * a + MPF[j]); MC[j][k] = Math.cos(m * a + MPF[j]); });
+    ux[i] = hc[k]; uy[i] = hs[k]; fr[i] = .35 * hu[k] / 3;
+    hx[i] = CX + hc[k] * (RF + hu[k] * BLUR_F); hy[i] = CY + hs[k] * (RF + hu[k] * BLUR_F);
+    st[i] = 0;
+    common(i, hx[i], hy[i], a);
+    role[i] = 2; dr[i] = (Math.random() - .5) * .012;
+  }
+}
+
+// ---- untouched ring table (per frame) ----
+const LX = new Float32Array(M), LY = new Float32Array(M), NXa = new Float32Array(M), NYa = new Float32Array(M);
+const SP = new Float32Array(M), BL = new Float32Array(M), SWU = new Float32Array(M);
+const JM = [[2, -.31, .006], [3, .23, .004], [5, -.17, .002]].map(([k, w, a]) => [k, w, a, Math.random() * 6.28]);
+const SMU = [[2, .23], [3, .41], [4, .29]].map(([k, w]) => [k, w, Math.random() * 6.28]);
+function buildRing(t) {
+  const breath = BREATHE * .012 * Math.sin(t * .45), sw = P.swell / 2.2;
+  for (let j = 0; j < M; j++) {
+    const a = j / M * TWO_PI;
+    let r = 1 + breath;
+    for (const [k, w, amp, ph] of JM) r += BREATHE * amp * Math.sin(k * a + w * t + ph);
+    r *= RU;
+    NXa[j] = Math.cos(a); NYa[j] = Math.sin(a);
+    LX[j] = CX + r * NXa[j]; LY[j] = CY + r * NYa[j]; SP[j] = r;
+    BL[j] = envU(j / M * 360);
+    let pulse = 0; for (const [k, w, ph] of SMU) pulse += Math.sin(k * a + w * t + ph);
+    SWU[j] = Math.max(.5, 1 + sw * pulse);
+  }
+}
+
+const cg = new Float32Array(GROUPS), sg = new Float32Array(GROUPS), OM = Array.from({ length: GROUPS }, (_, g) => .8 + g * .25);
+let tau = 0, last = performance.now(), paused = false, dirty = false;
+
+// ---- Split / shatter state ----
+const SPLIT_AT = 1.6;                                  // where the tension snaps
+const SH = { active: false, age: 0, hold: 0, reform: false, src: '', crack: 0, power: 1, cx: 0, cy: 0 };
+// The ring breaks into jagged pieces that fly out together, then disintegrate into loose particles
+const FR = 15, FVX = new Float32Array(FR), FVY = new Float32Array(FR);
+function shatter(src, crack, cx = 0, cy = 0) {
+  Object.assign(SH, { active: true, age: 0, hold: 0, reform: false, src, crack, cx, cy });
+  for (let f = 0; f < FR; f++) {
+    const a = crack + (f + .5) / FR * TWO_PI + gauss() * .18, sp = .45 + .7 * Math.random();
+    FVX[f] = Math.cos(a) * sp; FVY[f] = Math.sin(a) * sp;
+  }
+  spawnMarbles();
+}
+
+// ---- Marbles: the broken ring becomes a swarm of little spheres that fly, ricochet off the edges,
+// knock into each other — and when two collide they fuse, morphing into one larger sphere.
+const MARBLES = 1600, RMAX = 5, GRACE = .12, FUSE = false;   // FUSE: true lets colliding spheres merge (up to RMAX)            // RMAX: largest radius a fused sphere can reach (5 = 10px across)
+let marbles = [];
+function spawnMarbles() {
+  marbles = [];
+  const rot = P.position * Math.PI / 180, V = 1500 * SH.power;
+  for (let n = 0; n < MARBLES; n++) {
+    const a = Math.random() * TWO_PI;                                   // angle in the ring's own frame
+    let d = Math.abs(a - SH.crack) % TWO_PI; if (d > Math.PI) d = TWO_PI - d;
+    let fa = (a - SH.crack) % TWO_PI; if (fa < 0) fa += TWO_PI;
+    const fi = Math.min(FR - 1, (fa / TWO_PI * FR) | 0), g = .6 + .8 * Math.random();
+    const rr = RU + (Math.random() - .5) * STROKE;
+    let x = Math.cos(a) * rr, y = Math.sin(a) * rr;
+    let vx = ((FVX[fi] + .45 * SH.cx) * g + gauss() * .18) * V, vy = ((FVY[fi] + .45 * SH.cy) * g + gauss() * .18) * V;
+    const c = Math.cos(rot), s2 = Math.sin(rot);
+    const r = Math.min(RMAX, P.size * (.9 + .6 * Math.random()));
+    marbles.push({ x: CX + x * c - y * s2, y: CY + x * s2 + y * c, vx: vx * c - vy * s2, vy: vx * s2 + vy * c,
+                   r, rt: r, t: 0, delay: .12 * d / Math.PI, alpha: 1, gx: 0, gy: 0, gr: 0, gt: 0 });
+  }
+}
+function stepMarbles(dt) {
+  if (!marbles.length) return;
+  const live = [];
+  for (const b of marbles) {
+    if (SH.age < b.delay) continue;                                     // the crack hasn't reached it yet
+    b.t += dt;
+    b.x += b.vx * dt; b.y += b.vy * dt;
+    const fr = Math.exp(-.35 * dt); b.vx *= fr; b.vy *= fr;              // only a little drag: they keep going haywire
+    if (b.x < b.r) { b.x = b.r; b.vx = Math.abs(b.vx) * .9; } else if (b.x > W - b.r) { b.x = W - b.r; b.vx = -Math.abs(b.vx) * .9; }
+    if (b.y < b.r) { b.y = b.r; b.vy = Math.abs(b.vy) * .9; } else if (b.y > W - b.r) { b.y = W - b.r; b.vy = -Math.abs(b.vy) * .9; }
+    b.r += (b.rt - b.r) * Math.min(1, dt * 9);                           // grow smoothly into its new size
+    if (b.gt > 0) b.gt -= dt;
+    if (SH.reform) b.alpha = Math.max(0, b.alpha - dt * 2.5);
+    if (b.t > GRACE) live.push(b);
+  }
+  // collisions via a coarse grid
+  const C = 40, grid = new Map(), dead = new Set();
+  live.forEach((b, i) => {
+    const x0 = Math.floor((b.x - b.r) / C), x1 = Math.floor((b.x + b.r) / C), y0 = Math.floor((b.y - b.r) / C), y1 = Math.floor((b.y + b.r) / C);
+    for (let gy = y0; gy <= y1; gy++) for (let gx = x0; gx <= x1; gx++) {
+      const k = gy * 1000 + gx; let c = grid.get(k); if (!c) grid.set(k, c = []); c.push(i);
+    }
+  });
+  for (const cell of grid.values()) for (let p = 0; p < cell.length; p++) for (let q = p + 1; q < cell.length; q++) {
+    const A = live[cell[p]], B = live[cell[q]];
+    if (dead.has(A) || dead.has(B)) continue;
+    const dx = B.x - A.x, dy = B.y - A.y, d2 = dx * dx + dy * dy, rs = A.r + B.r;
+    if (d2 >= rs * rs || d2 === 0) continue;
+    const ma = A.rt * A.rt, mb = B.rt * B.rt, nr = Math.sqrt(ma + mb);
+    if (FUSE && nr <= RMAX) {                                                    // fuse: the bigger one absorbs the smaller
+      const [K, L] = ma >= mb ? [A, B] : [B, A], mk = K.rt * K.rt, ml = L.rt * L.rt, mt = mk + ml;
+      const nx = (K.x * mk + L.x * ml) / mt, ny = (K.y * mk + L.y * ml) / mt;
+      K.vx = (K.vx * mk + L.vx * ml) / mt; K.vy = (K.vy * mk + L.vy * ml) / mt;
+      K.gx = L.x - nx; K.gy = L.y - ny; K.gr = L.r; K.gt = .28;          // the absorbed sphere melts into it
+      K.x = nx; K.y = ny; K.rt = nr; K.alpha = Math.min(K.alpha, L.alpha);
+      dead.add(L);
+    } else {                                                             // they ricochet off each other
+      const d = Math.sqrt(d2), ux = dx / d, uy = dy / d, ov = rs - d;
+      A.x -= ux * ov * mb / (ma + mb); A.y -= uy * ov * mb / (ma + mb); B.x += ux * ov * ma / (ma + mb); B.y += uy * ov * ma / (ma + mb);
+      const rv = (B.vx - A.vx) * ux + (B.vy - A.vy) * uy;
+      if (rv < 0) { const j = -1.9 * rv / (1 / ma + 1 / mb); A.vx -= j * ux / ma; A.vy -= j * uy / ma; B.vx += j * ux / mb; B.vy += j * uy / mb; }
+    }
+  }
+  if (dead.size) marbles = marbles.filter(b => !dead.has(b));
+  if (!SH.active) marbles = [];
+}
+function ball(x, y, r, a) {                            // a solid little sphere: full ink, soft anti-aliased rim
+  if (r < .4 || a <= 0) return;
+  const x0 = Math.max(0, Math.floor(x - r - 1)), x1 = Math.min(W - 1, Math.ceil(x + r + 1));
+  const y0 = Math.max(0, Math.floor(y - r - 1)), y1 = Math.min(W - 1, Math.ceil(y + r + 1));
+  for (let py = y0; py <= y1; py++) for (let px = x0; px <= x1; px++) {
+    const d = Math.hypot(px + .5 - x, py + .5 - y), cov = Math.min(1, Math.max(0, r - d + .5));
+    if (cov > 0) acc[py * W + px] += a * cov * Math.min(1, 2.4 * Math.sqrt(Math.max(0, 1 - (d * d) / (r * r))) + .25);
+  }
+}
+function drawMarbles() {
+  for (const b of marbles) {
+    if (SH.age < b.delay) continue;
+    const appear = smooth(0, .1, b.t) * b.alpha;
+    ball(b.x, b.y, b.r, appear);
+    if (b.gt > 0) { const k = b.gt / .28; ball(b.x + b.gx * k, b.y + b.gy * k, b.gr * Math.sqrt(k), appear); }
+  }
+}
+function updateShatter(dt) {
+  const v = P.thaw;
+  if (v >= SPLIT_AT && (!SH.active || SH.src === 'cut')) { if (!SH.active) shatter('slider', Math.random() * TWO_PI); SH.src = 'slider'; SH.reform = false; }
+  if (!SH.active) return;
+  SH.power = SH.src === 'slider' ? .55 + .9 * smooth(SPLIT_AT, 2, v) : 1;
+  SH.hold += dt;
+  if (SH.src === 'slider' && v < SPLIT_AT) SH.reform = true;
+  if (SH.src === 'cut' && SH.hold > 6) SH.reform = true;            // a cut heals after a while
+  if (SH.reform) {
+    SH.age -= dt * (SH.src === 'slider' ? 3 : 1.2);
+    if (SH.age <= 0) Object.assign(SH, { active: false, age: 0, reform: false });
+  } else SH.age = Math.min(2.5, SH.age + dt);
+  stepMarbles(dt);
+  dirty = true;
+}
+function splatDot(x, y, w) {                           // a bigger speck (~2.5px)
+  const q = w / 4; splat(x - .8, y - .8, q); splat(x + .8, y - .8, q); splat(x - .8, y + .8, q); splat(x + .8, y + .8, q);
+}
+let realT = 0;
+
+function render() {
+  moveEdges(tau); tauNow = tau;
+  const v = P.thaw, m = Math.min(1, v);
+  const ten = SH.active ? 0 : smooth(1, SPLIT_AT, v);                   // tension before the snap
+  const big = smooth(.85, 1, v) * (1 - smooth(1, 1.15, v));            // bigger loose specks, only around Thaw 1
+  const mo = P.motion;                                                  // (time itself slows under tension, see frame)
+  const trem = 4 * ten * ten, tc = Math.cos(realT * 23), ts = Math.sin(realT * 23);
+  const shOn = SH.active && SH.age > 0, V = 1500 * SH.power;
+  const needU = m > 0;
+  KN = P.size > 1.2 ? kernels(P.size) : null; KB = kernels(Math.max(2.5, P.size * 1.7));
+  const SPK = .75 * Math.PI * (Math.max(2.5, P.size * 1.7) / 2) ** 2;   // enough ink for each flung speck to read as a solid little sphere
+  if (needU) buildRing(tau);
+  const A = 0, J = 0;                                                  // the frozen disc doesn't drift
+  const a1 = .7 * tau, a2 = -.45 * tau, a3 = -.6 * tau, a4 = .5 * tau;
+  const c1 = Math.cos(a1), s1 = Math.sin(a1), c2 = Math.cos(a2), s2 = Math.sin(a2);
+  const c3 = Math.cos(a3), s3 = Math.sin(a3), c4 = Math.cos(a4), s4 = Math.sin(a4);
+  for (let g = 0; g < GROUPS; g++) { cg[g] = Math.cos(OM[g] * tau); sg[g] = Math.sin(OM[g] * tau); }
+  const [S0, S1, S2, S3] = S, [C0, C1, C2, C3] = C, R2 = RF * RF;
+  const mcF = MODES_F.map(([, w]) => Math.cos(w * tau)), msF = MODES_F.map(([, w]) => Math.sin(w * tau));
+  const [M0, M1, M2, M3] = MS, [N0, N1, N2, N3] = MC, swF = P.swell / 2.2;
+  const wsL = 1.7 * TWO_PI / NL, whZ = TWO_PI * 2.5066 / NZ, AZ = 2 * mo;
+  const rot = P.position * Math.PI / 180, cr = Math.cos(rot), sr = Math.sin(rot);
+  acc.fill(0);
+
+  const skipRing = SH.active && !SH.reform && SH.age > .8;              // ring fully gone: only marbles to draw
+  for (let i = 0; i < T && !skipRing; i++) {
+    const e = m <= 0 ? 0 : m >= 1 ? 1 : smooth(st[i], st[i] + .55, m);
+    const g = grp[i], ca = cg[g], sa = sg[g];
+    let x0 = 0, y0 = 0, w0 = 0, x1 = 0, y1 = 0, w1 = 0, dotI = false;
+
+    if (e < 1) {                                             // ---- where it is in the frozen drop
+      let dx = A * (S0[i] * c1 + C0[i] * s1 + S1[i] * c2 + C1[i] * s2) + J * (jc[i] * ca - js[i] * sa);
+      let dy = A * (S2[i] * c3 + C2[i] * s3 + S3[i] * c4 + C3[i] * s4) + J * (js[i] * ca + jc[i] * sa);
+      if (i < N) {
+        const q = (dx * ux[i] + dy * uy[i]) * (1 - fr[i]); dx -= ux[i] * q; dy -= uy[i] * q;
+        let x = hx[i] - CX + dx, y = hy[i] - CY + dy;
+        const r2 = x * x + y * y;
+        if (r2 > R2) { const eb = envF(Math.atan2(y, x) * 57.2958), r = Math.sqrt(r2), k = (RF + (r - RF) * (2 * eb - 1)) / r; x *= k; y *= k; }
+        x0 = x + CX; y0 = y + CY; w0 = INK;
+      } else {
+        const k = i - N, b = envF(hdeg[k]);
+        if (b >= .03) {
+          const pulse = M0[k] * mcF[0] + N0[k] * msF[0] + M1[k] * mcF[1] + N1[k] * msF[1]
+                      + .7 * (M2[k] * mcF[2] + N2[k] * msF[2]) + .5 * (M3[k] * mcF[3] + N3[k] * msF[3]);
+          const br = b * Math.max(.2, 1 + swF * pulse);
+          // powder: every grain slowly lifts off the edge and drifts outward and sideways, thinning as it goes,
+          // then is replaced by a fresh one at the rim — so the haze disperses freely, never held to an outline
+          let cyc = (tauNow * .09 + kr[i]) % 1;
+          const u = REACH * hu[k] * (1 + 2.2 * cyc * cyc), r = RF + u * BLUR_F * br;
+          const side = (js[i] > 0 ? 1 : -1) * cyc * u * BLUR_F * br * .35;            // sideways drift grows with distance
+          const swirl = u * BLUR_F * br * .12;                                         // a little frosted wander
+          x0 = CX + hc[k] * r - hs[k] * side + swirl * (jc[i] * ca - js[i] * sa);
+          y0 = CY + hs[k] * r + hc[k] * side + swirl * (js[i] * ca + jc[i] * sa);
+          w0 = INK * Math.min(4, 1 / br) * (1 - cyc) ** 1.2 / .55 * REACH;            // same tone when the reach changes                    // grains fade as they disperse
+        } else { x0 = CX + hc[k] * RF; y0 = CY + hs[k] * RF; }
+      }
+    }
+
+    if (e > 0) {                                             // ---- where it belongs in the untouched drop
+      let a = (a0[i] + dr[i] * mo * tau) % 1; if (a < 0) a += 1;
+      const j = (a * M) | 0;
+      if (role[i] === 1) {
+        const vis = Math.pow(1 - BL[j], 1.3);
+        const u = du[i] + .06 * mo * (js[i] * ca + jc[i] * sa) * (Math.abs(du[i]) < .4 ? 1 : 0);
+        const loose = P.loose * (1.2 + 22 * Math.pow(BL[j], .7));
+        const n = u * STROKE + ds[i] * loose * (Math.abs(du[i]) > .3 ? 1 : .35) * (1 - .8 * ten)
+                + trem * (jc[i] * tc - js[i] * ts);              // the ring trembles as tension builds
+        x1 = LX[j] + NXa[j] * n; y1 = LY[j] + NYa[j] * n; w1 = vis * wsL * SP[j] * STROKE;
+      } else {
+        const b = BL[j];
+        const sd = HZ_SD * BLUR_U * SWU[j] * (.25 + .75 * b) * (1 - .55 * ten), n = dn[i] * sd;   // haze draws in under tension
+        x1 = LX[j] + NXa[j] * n + AZ * (jc[i] * ca - js[i] * sa); y1 = LY[j] + NYa[j] * n + AZ * (js[i] * ca + jc[i] * sa);
+        if (b >= .02) w1 = (P.haze + (1 - P.haze) * (1 - b)) * whZ * SP[j] * sd / (1 + n / RU);
+        if (big > 0 && Math.abs(dn[i]) > .9) {                 // loose outer haze: fewer, bigger specks, same tone
+          if (kr[i] * (1 + 5 * big) > 1) w1 = 0; else { w1 *= 1 + 5 * big; dotI = true; }
+        }
+      }
+    }
+
+    const ew = e * e * e;                                    // keeps its ink while it travels, settles to its new tone on arrival
+    let w = w0 + (w1 - w0) * ew;
+    let x = x0 + (x1 - x0) * e - CX, y = y0 + (y1 - y0) * e - CY;
+    if (shOn) {
+      // the crack runs round the ring from where it broke; each particle is flung once it reaches it
+      let d = Math.abs(a0[i] * TWO_PI - SH.crack) % TWO_PI; if (d > Math.PI) d = TWO_PI - d;
+      const ai = SH.age - .12 * d / Math.PI;
+      if (ai > 0) {
+        const k = (1 - Math.exp(-2.4 * ai)) / 2.4 * V;           // fast release, then drag
+        let fa = (a0[i] * TWO_PI - SH.crack + dn[i] * .025) % TWO_PI; if (fa < 0) fa += TWO_PI;   // jagged piece edges
+        const fi = Math.min(FR - 1, (fa / TWO_PI * FR) | 0), mix = smooth(.08, 1.1, ai);       // pieces, then dust
+        x += (FVX[fi] + (shx[i] - FVX[fi]) * mix + .45 * SH.cx) * k;
+        y += (FVY[fi] + (shy[i] - FVY[fi]) * mix + .45 * SH.cy) * k;
+        const sp = 0;                                            // the marbles take over from here
+        const f = role[i] === 1 ? smooth(.05, .22, ai) : smooth(0, .3, ai);
+        w += (sp - w) * f; if (f > .5) dotI = true;
+      }
+    }
+    if (w <= 0) continue;
+    const X = CX + x * cr - y * sr, Y = CY + x * sr + y * cr;
+    if (dotI) splatK(X, Y, w, KB);
+    else if (KN && w > .12) splatK(X, Y, w, KN);       // faint haze grains stay as plain points (they only read as tone)
+    else splat(X, Y, w);
+  }
+
+  if (SH.active) drawMarbles();
+  for (let i = 0, n = W * W; i < n; i++) {
+    const v = acc[i];
+    u32[i] = v <= 0 ? 0 : (v >= 1 ? 255 : (v * 255) | 0) << 24;   // black, alpha = density
+  }
+  ctx.putImageData(img, 0, 0);
+  copyToRec();
+}
+
+function frame(now) {
+  const dt = Math.min(.05, (now - last) / 1000); last = now;
+  if (!paused) { realT += dt; updateShatter(dt); }
+  if (!paused) {
+    tau += dt * P.speed * (SH.active ? 1 : 1 - .85 * smooth(1, SPLIT_AT, P.thaw));
+    updateBulges(dt * P.speed, tau);
+  }
+  if (!paused || dirty) { render(); dirty = false; }
+  requestAnimationFrame(frame);
+}
+
+function fit() { const s = Math.min(innerWidth, innerHeight); cv.style.width = cv.style.height = s + 'px'; }
+addEventListener('resize', fit);
+for (const id of ids) document.getElementById(id).addEventListener('input', () => { readControls(); dirty = true; });
+document.getElementById('density').addEventListener('change', () => { readControls(); build(); dirty = true; });   // rebuilds the particles
+addEventListener('keydown', e => { if (e.key === 'h' || e.key === 'H') document.body.classList.toggle('hidden'); });
+document.getElementById('pause').onclick = e => { paused = !paused; e.target.textContent = paused ? 'Play' : 'Pause'; };
+
+const download = (blob, file) => {
+  const l = document.createElement('a'); l.href = URL.createObjectURL(blob);
+  l.download = file; l.click(); setTimeout(() => URL.revokeObjectURL(l.href), 1000);
+};
+document.getElementById('save').onclick = () => cv.toBlob(b => download(b, 'thaw-drop.png'));
+
+// ---- Record (click again to stop); drag Thaw while recording to capture the transition ----
+const rc = document.createElement('canvas'), rctx = rc.getContext('2d');
+const recBtn = document.getElementById('rec'), vbg = document.getElementById('vbg');
+let rec = null;
+function copyToRec() {
+  if (!rec) return;
+  rctx.clearRect(0, 0, W, W);
+  if (vbg.value) { rctx.fillStyle = vbg.value; rctx.fillRect(0, 0, W, W); }
+  rctx.drawImage(cv, 0, 0);
+}
+recBtn.onclick = () => {
+  if (rec) { rec.stop(); return; }
+  const type = ['video/webm;codecs=vp9', 'video/webm;codecs=vp8', 'video/webm', 'video/mp4']
+    .find(t => window.MediaRecorder && MediaRecorder.isTypeSupported(t));
+  if (!type) { alert('Video recording is not supported in this browser. Try Chrome.'); return; }
+  rc.width = rc.height = W;
+  const chunks = [];
+  rec = new MediaRecorder(rc.captureStream(30), { mimeType: type, videoBitsPerSecond: 12e6 });
+  rec.ondataavailable = e => { if (e.data.size) chunks.push(e.data); };
+  rec.onstop = () => {
+    download(new Blob(chunks, { type }), 'thaw-drop' + (type.includes('mp4') ? '.mp4' : '.webm'));
+    rec = null; recBtn.textContent = 'Record';
+  };
+  copyToRec(); rec.start(); recBtn.textContent = 'Stop';
+};
+
+// ---- Easter egg: slice across the ring with the cursor ----
+let lastPt = null;
+addEventListener('pointermove', e => {
+  if (e.target.closest && e.target.closest('.panel,.ui,.thaw')) { lastPt = null; return; }
+  const rc2 = cv.getBoundingClientRect(), k = W / rc2.width;
+  const pt = { x: (e.clientX - rc2.left) * k, y: (e.clientY - rc2.top) * k, t: performance.now() };
+  if (lastPt && P.thaw >= .98 && P.thaw < SPLIT_AT && !SH.active) {
+    const r0 = Math.hypot(lastPt.x - CX, lastPt.y - CY), r1 = Math.hypot(pt.x - CX, pt.y - CY);
+    const dist = Math.hypot(pt.x - lastPt.x, pt.y - lastPt.y), speed = dist / Math.max(1, pt.t - lastPt.t);
+    if ((r0 - RU) * (r1 - RU) < 0 && speed > 1.2) {             // crossed the ring, fast: a cut
+      const f = (r0 - RU) / (r0 - r1), cx = lastPt.x + (pt.x - lastPt.x) * f - CX, cy = lastPt.y + (pt.y - lastPt.y) * f - CY;
+      const rot = P.position * Math.PI / 180;
+      const ux = (pt.x - lastPt.x) / dist, uy = (pt.y - lastPt.y) / dist;
+      // undo the Position rotation so the crack and the cut direction sit in the ring's own frame
+      shatter('cut', Math.atan2(cy, cx) - rot, ux * Math.cos(rot) + uy * Math.sin(rot), -ux * Math.sin(rot) + uy * Math.cos(rot));
+    }
+  }
+  lastPt = pt;
+});
+
+readControls(); build(); fit(); requestAnimationFrame(frame);
+</script>
+</body>
+</html>
